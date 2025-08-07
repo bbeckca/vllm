@@ -15,32 +15,48 @@ namespace vllm {
 // TODO(woosuk): Further optimize this kernel.
 template <typename scalar_t>
 __global__ void rms_norm_kernel(
-    scalar_t* __restrict__ out,          // [..., hidden_size]
-    const scalar_t* __restrict__ input,  // [..., hidden_size]
-    const int64_t input_stride,
-    const scalar_t* __restrict__ weight,  // [hidden_size]
-    const float epsilon, const int num_tokens, const int hidden_size) {
-  __shared__ float s_variance;
+    scalar_t* __restrict__ out,             // [..., hidden_size]
+    const scalar_t* __restrict__ input,     // [..., hidden_size]
+    int64_t input_stride,
+    const scalar_t* __restrict__ weight,    // [hidden_size]
+    float epsilon,
+    int num_tokens,
+    int hidden_size) {
+
   float variance = 0.0f;
 
-  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    const float x = (float)input[blockIdx.x * input_stride + idx];
-    variance += x * x;
+  // === Vectorized variance accumulation ===
+  using Vec = AlignedVector<float, 4>;
+  constexpr int kVecSize = 4;
+
+  int vec_hidden_size = hidden_size / kVecSize;
+  const Vec* vec_input = reinterpret_cast<const Vec*>(
+      &input[blockIdx.x * input_stride]);
+
+  for (int vec_idx = threadIdx.x; vec_idx < vec_hidden_size; vec_idx += blockDim.x) {
+    Vec v = vec_input[vec_idx];
+    #pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      float x = v[i];
+      variance += x * x;
+    }
   }
 
   using BlockReduce = cub::BlockReduce<float, 1024>;
   __shared__ typename BlockReduce::TempStorage reduceStore;
-  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{});
 
+  __shared__ float s_variance;
   if (threadIdx.x == 0) {
     s_variance = rsqrtf(variance / hidden_size + epsilon);
   }
   __syncthreads();
 
+  // === Original scalar output write ===
   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
-    float x = (float)input[blockIdx.x * input_stride + idx];
+    float x = static_cast<float>(input[blockIdx.x * input_stride + idx]);
     out[blockIdx.x * hidden_size + idx] =
-        ((scalar_t)(x * s_variance)) * weight[idx];
+        static_cast<scalar_t>((x * s_variance) * weight[idx]);
   }
 }
 
